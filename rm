@@ -1,17 +1,17 @@
 #!/bin/bash
 
-# Define the trash directory
 trash_dir="/trash"
 mkdir -p "$trash_dir"
 
 files_to_trash=()
 use_real_rm=false
+force=false
 
-# Separate flags from files
 for arg in "$@"; do
     case "$arg" in
         --help|--version) use_real_rm=true; break ;;
-        -f|-i|-v|-I|--force|--interactive|--verbose) continue ;;
+        -f|--force) force=true ;;
+        -i|-v|-I|--interactive|--verbose) continue ;;
         -r|-R|--recursive) continue ;;
         -*) use_real_rm=true; break ;;
         *) files_to_trash+=("$arg") ;;
@@ -22,7 +22,14 @@ if [ "$use_real_rm" = true ] || [ ${#files_to_trash[@]} -eq 0 ]; then
     /bin/rm "$@"
 else
     for file in "${files_to_trash[@]}"; do
-        base_name=$(basename "$file")
+        if [ ! -e "$file" ]; then
+            [[ "$force" == false ]] && echo "rm: cannot remove '$file': No such file or directory"
+            continue
+        fi
+
+        # OPTIMIZATION: Use Bash built-in parameter expansion instead of 'basename'
+        # ${file##*/} strips everything up to the last /
+        base_name="${file##*/}"
         
         if [ -e "$trash_dir/$base_name" ]; then
             random_suffix=$(mktemp -u XXXXXXXXXXXX)
