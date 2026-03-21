@@ -21,6 +21,7 @@ TRASH_SUBDIR="${TRASH_SUBDIR:-trash}"   # name of trash directory at mountpoint 
 
 force=false
 use_real_rm=false
+clean_current_mountpoint=false
 files_to_trash=()
 
 orig_argv=("$@")
@@ -34,6 +35,10 @@ while [ $# -gt 0 ]; do
             ;;
         -f|--force)
             force=true
+            shift
+            ;;
+        --clean)
+            clean_current_mountpoint=true
             shift
             ;;
         -i|-v|-I|--interactive|--verbose|-r|-R|--recursive)
@@ -60,8 +65,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$clean_current_mountpoint" = true ] && [ ${#files_to_trash[@]} -gt 0 ]; then
+    echo "rm: cannot use --clean with file operands" >&2
+    exit 2
+fi
+
 # If passing through, do it with the original arguments
-if [ "$use_real_rm" = true ] || [ ${#files_to_trash[@]} -eq 0 ]; then
+if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ ${#files_to_trash[@]} -eq 0 ]; }; then
     exec /bin/rm "${orig_argv[@]}"
 fi
 
@@ -77,6 +87,16 @@ get_mountpoint() {
     stat -c %m -- "$1"
 }
 
+trash_dir_for_mountpoint() {
+    # $1 = mountpoint
+    local mp="$1"
+    if [ "$mp" = "/" ]; then
+        echo "/$TRASH_SUBDIR"
+    else
+        echo "${mp%/}/$TRASH_SUBDIR"
+    fi
+}
+
 ensure_trash_dir() {
     # $1 = mountpoint
     local mp="$1"
@@ -87,11 +107,7 @@ ensure_trash_dir() {
     fi
 
     local dir
-    if [ "$mp" = "/" ]; then
-        dir="/$TRASH_SUBDIR"
-    else
-        dir="${mp%/}/$TRASH_SUBDIR"
-    fi
+    dir="$(trash_dir_for_mountpoint "$mp")"
 
     # mkdir -p is cheap; still cache to avoid repeated calls
     if ! mkdir -p -- "$dir" 2>/dev/null; then
@@ -99,6 +115,32 @@ ensure_trash_dir() {
     fi
 
     ensured_trash_dir[$key]="$dir"
+    return 0
+}
+
+clean_current_trash() {
+    local mp
+    if ! mp="$(get_mountpoint "." 2>/dev/null)"; then
+        if [ "$force" = false ]; then
+            echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
+        fi
+        return 1
+    fi
+
+    local dir
+    dir="$(trash_dir_for_mountpoint "$mp")"
+    if [ ! -d "$dir" ]; then
+        return 0
+    fi
+
+    # find -delete handles hidden entries and does not require shell globs.
+    if ! find "$dir" -mindepth 1 -delete 2>/dev/null; then
+        if [ "$force" = false ]; then
+            echo "rm: cannot clean trash at '$dir': Permission denied or deletion failed" >&2
+        fi
+        return 1
+    fi
+
     return 0
 }
 
@@ -173,6 +215,13 @@ trash_one() {
     fi
     return 1
 }
+
+if [ "$clean_current_mountpoint" = true ]; then
+    if clean_current_trash; then
+        exit 0
+    fi
+    exit 1
+fi
 
 for f in "${files_to_trash[@]}"; do
     if ! trash_one "$f"; then

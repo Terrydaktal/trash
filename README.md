@@ -10,6 +10,7 @@ The `trash` script intercepts `rm` calls and moves files to a `trash/` directory
 - **Per-Mountpoint Trashing**: Automatically detects the mountpoint of each file (e.g., `/`, `/home`, `/mnt/data`) and moves it to a local `trash/` subdirectory.
 - **Collision Prevention**: If a file with the same name already exists in the trash, it appends a unique suffix (timestamp + nanoseconds + PID) to prevent overwrites.
 - **Permissions Preservation**: Uses `mv` to preserve file ownership and permissions.
+- **Current-Disk Cleanup**: `trash --clean` removes all contents of the trash directory for the mountpoint of your current working directory.
 - **Safety Fallback**: If flags like `--help` or `--version` are used, or if the script encounters unknown options, it safely passes the call through to the real `/bin/rm`.
 
 ---
@@ -66,3 +67,4 @@ end
 ## Operation Notes
 - **Recursive Deletion**: The `-r` and `-R` flags are accepted but ignored; since `mv` can move directories, the script naturally handles recursive "deletion" by moving the entire tree to the trash.
 - **Force Flag**: The `-f` flag suppresses error messages (e.g., if a file doesn't exist), mimicking standard `rm` behavior.
+- **Trash Cleanup**: `trash --clean` clears hidden and non-hidden entries from the current mountpoint's trash directory and leaves the directory itself in place.
