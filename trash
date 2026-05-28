@@ -75,7 +75,54 @@ if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ $
     exec /bin/rm "${orig_argv[@]}"
 fi
 
-# --- 2) TRASH IMPLEMENTATION ---
+# --- 2) MASTER FOLDER GENERATION ---
+# Generate a unique, timestamped folder name using prefixes of the first few targets
+names=()
+for item in "${files_to_trash[@]:0:2}"; do
+    # Get basename and replace special/unsafe characters with underscores
+    clean_name="$(basename -- "$item" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+    if [ -n "$clean_name" ]; then
+        names+=("$clean_name")
+    fi
+done
+
+prefix=""
+if [ ${#names[@]} -gt 0 ]; then
+    # Join the names with underscores and add a trailing dash
+    prefix="$(IFS=_ ; echo "${names[*]}")-"
+fi
+
+RUN_DIR_NAME="deleted-${prefix}$(date +%Y%m%d-%H%M%S)-$$"
+
+# --- PRE-COMPUTE METADATA JSON CONTENT ---
+escape_json_string() {
+    local str="$1"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    str="${str//$'\n'/\\n}"
+    str="${str//$'\r'/\\r}"
+    str="${str//$'\t'/\\t}"
+    echo -n "$str"
+}
+
+cmd_name="rm"
+
+cmd_string="$cmd_name"
+if [ ${#orig_argv[@]} -gt 0 ]; then
+    escaped_args=$(printf "%q " "${orig_argv[@]}")
+    escaped_args="${escaped_args% }"
+    cmd_string="$cmd_name $escaped_args"
+fi
+
+METADATA_JSON_CONTENT="$(cat <<EOF
+{
+  "command": "$(escape_json_string "$cmd_string")",
+  "cwd": "$(escape_json_string "$PWD")"
+}
+EOF
+)"
+
+# --- 3) TRASH IMPLEMENTATION ---
 # Cache which mountpoints we've already ensured have a trash dir (speed).
 declare -A ensured_trash_dir=()
 
@@ -109,12 +156,15 @@ ensure_trash_dir() {
     local dir
     dir="$(trash_dir_for_mountpoint "$mp")"
 
-    # mkdir -p is cheap; still cache to avoid repeated calls
-    if ! mkdir -p -- "$dir" 2>/dev/null; then
+    # Create the run-specific subdirectory (master folder)
+    if ! mkdir -p -- "$dir/$RUN_DIR_NAME" 2>/dev/null; then
         return 1
     fi
 
-    ensured_trash_dir[$key]="$dir"
+    # Write the metadata JSON file containing the command and CWD
+    echo "$METADATA_JSON_CONTENT" > "$dir/$RUN_DIR_NAME/metadata.json" 2>/dev/null || true
+
+    ensured_trash_dir[$key]="$dir/$RUN_DIR_NAME"
     return 0
 }
 
