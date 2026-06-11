@@ -26,7 +26,20 @@ files_to_trash=()
 
 orig_argv=("$@")
 
-# --- 1) PARSE ARGUMENTS (robust) ---
+# --- 1) UNPACK COMBINED SHORT OPTIONS ---
+unpacked_args=()
+for arg in "$@"; do
+    if [[ "$arg" =~ ^-[a-zA-Z0-9]{2,}$ ]]; then
+        for (( i=1; i<${#arg}; i++ )); do
+            unpacked_args+=("-${arg:$i:1}")
+        done
+    else
+        unpacked_args+=("$arg")
+    fi
+done
+set -- "${unpacked_args[@]}"
+
+# --- 2) PARSE ARGUMENTS (robust) ---
 while [ $# -gt 0 ]; do
     case "$1" in
         --help|--version)
@@ -88,8 +101,8 @@ done
 
 prefix=""
 if [ ${#names[@]} -gt 0 ]; then
-    # Join the names with underscores and add a trailing dash
-    prefix="$(IFS=_ ; echo "${names[*]}")-"
+    # Join the names with plus signs and add a trailing dash
+    prefix="$(IFS=+ ; echo "${names[*]}")-"
 fi
 
 RUN_DIR_NAME="deleted-${prefix}$(date +%Y%m%d-%H%M%S)-$$"
@@ -181,6 +194,21 @@ clean_current_trash() {
     dir="$(trash_dir_for_mountpoint "$mp")"
     if [ ! -d "$dir" ]; then
         return 0
+    fi
+
+    # Require confirmation if stdout/stdin is a terminal and --force is not specified
+    if [ "$force" = false ] && [ -t 0 ] && [ -t 1 ]; then
+        echo "WARNING: This will permanently empty the trash at '$dir'." >&2
+        echo -n "To confirm, please type the full path of the trash directory: " >&2
+        local response
+        if ! read -r response; then
+            echo -e "\nError: Failed to read confirmation. Aborting." >&2
+            return 1
+        fi
+        if [ "$response" != "$dir" ]; then
+            echo "Confirmation failed (input did not match '$dir'). Aborting." >&2
+            return 1
+        fi
     fi
 
     # find -delete handles hidden entries and does not require shell globs.
