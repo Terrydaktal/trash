@@ -89,7 +89,31 @@ if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ $
 fi
 
 # --- 2) MASTER FOLDER GENERATION ---
-# Generate a unique, timestamped folder name using prefixes of the first few targets
+# Walk up the Linux process tree to find the execution chain
+process_chain=()
+curr_pid="$PPID"
+while [ "$curr_pid" -gt 1 ]; do
+    name=$(cat "/proc/$curr_pid/comm" 2>/dev/null || true)
+    if [ -n "$name" ]; then
+        process_chain+=("$name")
+    else
+        break
+    fi
+    next_pid=$(awk '{print $4}' "/proc/$curr_pid/stat" 2>/dev/null || true)
+    if [ -n "$next_pid" ] && [ "$next_pid" -ne "$curr_pid" ]; then
+        curr_pid="$next_pid"
+    else
+        break
+    fi
+done
+
+parent_app="unknown"
+if [ ${#process_chain[@]} -gt 0 ]; then
+    parent_app="$(echo "${process_chain[0]}" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+fi
+
+# Generate a unique, timestamped folder name using prefixes of the first few
+# targets and a sanitized parent app tag at the front.
 names=()
 for item in "${files_to_trash[@]:0:2}"; do
     # Get basename and replace special/unsafe characters with underscores
@@ -105,7 +129,7 @@ if [ ${#names[@]} -gt 0 ]; then
     prefix="$(IFS=+ ; echo "${names[*]}")-"
 fi
 
-RUN_DIR_NAME="deleted-${prefix}$(date +%Y%m%d-%H%M%S)-$$"
+RUN_DIR_NAME="(${parent_app})${prefix}$(date +%Y-%m-%d_%H-%M-%S)-pid-$$"
 
 # --- PRE-COMPUTE METADATA JSON CONTENT ---
 escape_json_string() {
@@ -127,10 +151,19 @@ if [ ${#orig_argv[@]} -gt 0 ]; then
     cmd_string="$cmd_name $escaped_args"
 fi
 
+invoked_by=""
+if [ ${#process_chain[@]} -gt 0 ]; then
+    invoked_by="${process_chain[0]}"
+    for (( i=1; i<${#process_chain[@]}; i++ )); do
+        invoked_by="$invoked_by <- ${process_chain[i]}"
+    done
+fi
+
 METADATA_JSON_CONTENT="$(cat <<EOF
 {
   "command": "$(escape_json_string "$cmd_string")",
-  "cwd": "$(escape_json_string "$PWD")"
+  "cwd": "$(escape_json_string "$PWD")",
+  "invoked_by": "$(escape_json_string "$invoked_by")"
 }
 EOF
 )"
@@ -225,12 +258,21 @@ clean_current_trash() {
 trash_one() {
     local file="$1"
 
+    # rm -f treats a missing operand as success.
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        if [ "$force" = false ]; then
+            echo "rm: cannot remove '$file': No such file or directory" >&2
+            return 1
+        fi
+        return 0
+    fi
+
     # Determine mountpoint (only on the slow-ish path where we actually do work)
     local mp
     if ! mp="$(get_mountpoint "$file" 2>/dev/null)"; then
-        # Probably doesn't exist (or weird permission). Try to produce rm-like error.
+        # Source exists, so this is some other failure (permissions, odd FS state, etc.).
         if [ "$force" = false ]; then
-            echo "rm: cannot remove '$file': No such file or directory" >&2
+            echo "rm: cannot remove '$file': failed to determine mountpoint" >&2
         fi
         return 1
     fi
@@ -283,8 +325,9 @@ trash_one() {
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then
         if [ "$force" = false ]; then
             echo "rm: cannot remove '$file': No such file or directory" >&2
+            return 1
         fi
-        return 1
+        return 0
     fi
 
     # Some other mv failure (permissions, immutable, etc.)
@@ -304,8 +347,7 @@ fi
 for f in "${files_to_trash[@]}"; do
     if ! trash_one "$f"; then
         had_error=1
-        # rm -f would typically suppress ENOENT; we already do that.
-        # For other errors, -f behaviour varies; we continue either way.
+        # We already match rm -f for missing paths; continue across operands either way.
     fi
 done
 
