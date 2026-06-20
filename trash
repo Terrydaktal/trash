@@ -19,6 +19,14 @@ set -euo pipefail
 # --- CONFIG ---
 TRASH_SUBDIR="${TRASH_SUBDIR:-trash}"   # name of trash directory at mountpoint (default: "trash")
 
+# Read space-separated list of exceptions from environment variable
+read -r -a exceptions_array <<< "${TRASH_EXCEPTIONS:-}"
+
+# Fallback: sensible default exceptions if the environment variable is not set
+if [ ${#exceptions_array[@]} -eq 0 ]; then
+    exceptions_array=("paru" "makepkg" "yay" "trigger.sh")
+fi
+
 force=false
 use_real_rm=false
 clean_current_mountpoint=false
@@ -39,7 +47,57 @@ for arg in "$@"; do
 done
 set -- "${unpacked_args[@]}"
 
-# --- 2) PARSE ARGUMENTS (robust) ---
+# --- 2) PROCESS TREE WALK & BYPASS CHECK ---
+# Walk up the Linux process tree using pure Bash to find the execution chain
+process_chain=()
+curr_pid="$PPID"
+while [ "$curr_pid" -gt 1 ]; do
+    if [ -f "/proc/$curr_pid/comm" ]; then
+        name=$(<"/proc/$curr_pid/comm")
+        name="${name//$'\n'/}"
+        process_chain+=("$name")
+    else
+        break
+    fi
+
+    # Read the full command line to check for script arguments (e.g. bash trigger.sh)
+    if [ -f "/proc/$curr_pid/cmdline" ]; then
+        cmdline=$(tr '\0' ' ' < "/proc/$curr_pid/cmdline" 2>/dev/null || true)
+        # If the cmdline matches any exception as a filename/word, bypass immediately
+        for exc in "${exceptions_array[@]}"; do
+            if [[ "$cmdline" =~ (^|[[:space:]]|/)"$exc"([[:space:]]|$) ]]; then
+                exec /bin/rm "${orig_argv[@]}"
+            fi
+        done
+    fi
+
+    next_pid=""
+    if [ -f "/proc/$curr_pid/status" ]; then
+        while IFS=$'\t ' read -r key value; do
+            if [ "$key" = "PPid:" ]; then
+                next_pid="$value"
+                break
+            fi
+        done < "/proc/$curr_pid/status"
+    fi
+
+    if [ -n "$next_pid" ] && [ "$next_pid" -ne "$curr_pid" ]; then
+        curr_pid="$next_pid"
+    else
+        break
+    fi
+done
+
+# If any application name itself in the execution chain is on the exceptions list, bypass trash
+for proc in "${process_chain[@]}"; do
+    for exc in "${exceptions_array[@]}"; do
+        if [ "$proc" = "$exc" ]; then
+            exec /bin/rm "${orig_argv[@]}"
+        fi
+    done
+done
+
+# --- 3) PARSE ARGUMENTS (robust) ---
 while [ $# -gt 0 ]; do
     case "$1" in
         --help|--version)
@@ -88,24 +146,7 @@ if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ $
     exec /bin/rm "${orig_argv[@]}"
 fi
 
-# --- 2) MASTER FOLDER GENERATION ---
-# Walk up the Linux process tree to find the execution chain
-process_chain=()
-curr_pid="$PPID"
-while [ "$curr_pid" -gt 1 ]; do
-    name=$(cat "/proc/$curr_pid/comm" 2>/dev/null || true)
-    if [ -n "$name" ]; then
-        process_chain+=("$name")
-    else
-        break
-    fi
-    next_pid=$(awk '{print $4}' "/proc/$curr_pid/stat" 2>/dev/null || true)
-    if [ -n "$next_pid" ] && [ "$next_pid" -ne "$curr_pid" ]; then
-        curr_pid="$next_pid"
-    else
-        break
-    fi
-done
+# --- 4) MASTER FOLDER GENERATION ---
 
 parent_app="unknown"
 if [ ${#process_chain[@]} -gt 0 ]; then
@@ -168,7 +209,7 @@ METADATA_JSON_CONTENT="$(cat <<EOF
 EOF
 )"
 
-# --- 3) TRASH IMPLEMENTATION ---
+# --- 5) TRASH IMPLEMENTATION ---
 # Cache which mountpoints we've already ensured have a trash dir (speed).
 declare -A ensured_trash_dir=()
 
