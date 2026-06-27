@@ -19,6 +19,9 @@ set -euo pipefail
 # --- CONFIG ---
 TRASH_SUBDIR="${TRASH_SUBDIR:-trash}"   # name of trash directory at mountpoint (default: "trash")
 
+# Always bypass trash for these apps, even when TRASH_EXCEPTIONS is overridden.
+hardcoded_exceptions_array=("netmgr")
+
 # Read space-separated list of exceptions from environment variable
 read -r -a exceptions_array <<< "${TRASH_EXCEPTIONS:-}"
 
@@ -27,12 +30,121 @@ if [ ${#exceptions_array[@]} -eq 0 ]; then
     exceptions_array=("paru" "makepkg" "yay" "trigger.sh")
 fi
 
+exceptions_array+=("${hardcoded_exceptions_array[@]}")
+
 force=false
 use_real_rm=false
 clean_current_mountpoint=false
+clean_app=""
+show_help=false
+show_version=false
 files_to_trash=()
 
 orig_argv=("$@")
+
+print_help() {
+    local prog
+    prog="$(basename -- "$0")"
+    cat <<EOF
+NAME
+    $prog - per-mountpoint rm wrapper with grouped trash folders and cleanup tools
+
+SYNOPSIS
+    $prog [OPTIONS] FILE...
+    $prog --clean [-f]
+    $prog --clean-app APP [-f]
+    $prog --help
+    $prog --version
+
+DESCRIPTION
+    $prog intercepts rm-style deletes and moves each target into a trash directory
+    on the same filesystem mountpoint instead of unlinking it immediately.
+
+    Files deleted in one command are grouped into a single run folder named like:
+    (APP)name1+name2-YYYY-MM-DD_HH-MM-SS-pid-PID
+
+    Each run folder contains a metadata.json audit record with the original
+    command, working directory, and parent execution chain.
+
+OPTIONS
+    -f, --force
+        Suppress missing-file diagnostics and bypass interactive cleanup prompts.
+
+    -r, -R, --recursive
+        Accepted for rm compatibility. Directories are moved as whole trees.
+
+    -i, -I, -v, --interactive, --verbose
+        Accepted for compatibility and ignored by the trash path.
+
+    --clean
+        Permanently delete all entries in the current mountpoint's trash
+        directory. Requires confirmation in an interactive terminal unless -f
+        is supplied.
+
+    --clean-app APP
+        Permanently delete grouped trash runs on the current mountpoint whose
+        folder name starts with (APP) or whose metadata invoked_by chain
+        contains APP as an exact process name. Requires confirmation in an
+        interactive terminal unless -f is supplied.
+
+    --help
+        Show this help text and exit.
+
+    --version
+        Show version information and exit.
+
+OPERATION
+    1. The script walks the parent process chain and bypasses trash entirely
+       for exception apps such as netmgr, paru, makepkg, yay, and trigger.sh.
+    2. For normal trashing, each target is moved into a per-run folder inside
+       MOUNTPOINT/TRASH_SUBDIR.
+    3. The run folder label prefers codex or agy when either appears in the
+       parent execution chain; otherwise it uses the immediate parent process.
+    4. Unknown options and unsupported rm modes fall back to the real /bin/rm.
+
+EXAMPLES
+    $prog file.txt dir
+    $prog -rf build-cache
+    $prog --clean
+    $prog -f --clean-app agy
+
+FILES
+    metadata.json
+        Written inside each grouped trash run folder with command, cwd, and
+        invoked_by audit data.
+
+PATHS
+    /trash
+        Trash root when the deleted file lives on the / mountpoint.
+
+    MOUNTPOINT/trash
+        Default trash root for non-root mountpoints.
+
+    TRASH_SUBDIR
+        Environment variable that changes the trash directory name from the
+        default of "trash".
+
+SECURITY NOTES
+    Cleanup modes use permanent deletion via /bin/rm.
+    Unknown options also fall through to /bin/rm for correctness.
+    If TRASH_EXCEPTIONS is set, its entries are added to the configurable
+    bypass list; netmgr is always hardcoded to bypass trash.
+
+EXIT STATUS
+    0  Success.
+    1  One or more targets or cleanup actions failed.
+    2  Invalid usage, such as a missing --clean-app value or conflicting modes.
+
+AUTHORS
+    Terrydaktal
+EOF
+}
+
+print_version() {
+    local prog
+    prog="$(basename -- "$0")"
+    printf '%s %s\n' "$prog" "0.1.0"
+}
 
 # --- 1) UNPACK COMBINED SHORT OPTIONS ---
 unpacked_args=()
@@ -50,12 +162,20 @@ set -- "${unpacked_args[@]}"
 # --- 2) PROCESS TREE WALK & BYPASS CHECK ---
 # Walk up the Linux process tree using pure Bash to find the execution chain
 process_chain=()
+preferred_parent_app=""
 curr_pid="$PPID"
 while [ "$curr_pid" -gt 1 ]; do
     if [ -f "/proc/$curr_pid/comm" ]; then
         name=$(<"/proc/$curr_pid/comm")
         name="${name//$'\n'/}"
         process_chain+=("$name")
+        if [ -z "$preferred_parent_app" ]; then
+            case "$name" in
+                codex|agy)
+                    preferred_parent_app="$name"
+                    ;;
+            esac
+        fi
     else
         break
     fi
@@ -63,6 +183,14 @@ while [ "$curr_pid" -gt 1 ]; do
     # Read the full command line to check for script arguments (e.g. bash trigger.sh)
     if [ -f "/proc/$curr_pid/cmdline" ]; then
         cmdline=$(tr '\0' ' ' < "/proc/$curr_pid/cmdline" 2>/dev/null || true)
+        if [ -z "$preferred_parent_app" ]; then
+            for app in codex agy; do
+                if [[ "$cmdline" =~ (^|[[:space:]]|/)"$app"([[:space:]]|$) ]]; then
+                    preferred_parent_app="$app"
+                    break
+                fi
+            done
+        fi
         # If the cmdline matches any exception as a filename/word, bypass immediately
         for exc in "${exceptions_array[@]}"; do
             if [[ "$cmdline" =~ (^|[[:space:]]|/)"$exc"([[:space:]]|$) ]]; then
@@ -100,9 +228,13 @@ done
 # --- 3) PARSE ARGUMENTS (robust) ---
 while [ $# -gt 0 ]; do
     case "$1" in
-        --help|--version)
-            use_real_rm=true
-            break
+        --help)
+            show_help=true
+            shift
+            ;;
+        --version)
+            show_version=true
+            shift
             ;;
         -f|--force)
             force=true
@@ -110,6 +242,22 @@ while [ $# -gt 0 ]; do
             ;;
         --clean)
             clean_current_mountpoint=true
+            shift
+            ;;
+        --clean-app)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "rm: option '--clean-app' requires an app name" >&2
+                exit 2
+            fi
+            clean_app="$2"
+            shift 2
+            ;;
+        --clean-app=*)
+            clean_app="${1#--clean-app=}"
+            if [ -z "$clean_app" ]; then
+                echo "rm: option '--clean-app' requires an app name" >&2
+                exit 2
+            fi
             shift
             ;;
         -i|-v|-I|--interactive|--verbose|-r|-R|--recursive)
@@ -141,8 +289,28 @@ if [ "$clean_current_mountpoint" = true ] && [ ${#files_to_trash[@]} -gt 0 ]; th
     exit 2
 fi
 
+if [ "$clean_current_mountpoint" = true ] && [ -n "$clean_app" ]; then
+    echo "rm: cannot combine --clean and --clean-app" >&2
+    exit 2
+fi
+
+if [ -n "$clean_app" ] && [ ${#files_to_trash[@]} -gt 0 ]; then
+    echo "rm: cannot use --clean-app with file operands" >&2
+    exit 2
+fi
+
+if [ "$show_help" = true ]; then
+    print_help
+    exit 0
+fi
+
+if [ "$show_version" = true ]; then
+    print_version
+    exit 0
+fi
+
 # If passing through, do it with the original arguments
-if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ ${#files_to_trash[@]} -eq 0 ]; }; then
+if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ -z "$clean_app" ] && [ ${#files_to_trash[@]} -eq 0 ]; }; then
     exec /bin/rm "${orig_argv[@]}"
 fi
 
@@ -150,7 +318,8 @@ fi
 
 parent_app="unknown"
 if [ ${#process_chain[@]} -gt 0 ]; then
-    parent_app="$(echo "${process_chain[0]}" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+    parent_app="${preferred_parent_app:-${process_chain[0]}}"
+    parent_app="${parent_app//[^a-zA-Z0-9._-]/_}"
 fi
 
 # Generate a unique, timestamped folder name using prefixes of the first few
@@ -248,8 +417,13 @@ ensure_trash_dir() {
         return 1
     fi
 
-    # Write the metadata JSON file containing the command and CWD
-    echo "$METADATA_JSON_CONTENT" > "$dir/$RUN_DIR_NAME/metadata.json" 2>/dev/null || true
+    # Write metadata atomically so a failed/interrupted write does not leave an empty audit file.
+    local metadata_tmp
+    metadata_tmp="$dir/$RUN_DIR_NAME/metadata.json.tmp.$$"
+    if ! printf '%s\n' "$METADATA_JSON_CONTENT" > "$metadata_tmp" 2>/dev/null || ! mv -f -- "$metadata_tmp" "$dir/$RUN_DIR_NAME/metadata.json" 2>/dev/null; then
+        /bin/rm -f -- "$metadata_tmp" 2>/dev/null || true
+        return 1
+    fi
 
     ensured_trash_dir[$key]="$dir/$RUN_DIR_NAME"
     return 0
@@ -293,6 +467,105 @@ clean_current_trash() {
         return 1
     fi
 
+    return 0
+}
+
+clean_trash_by_app() {
+    local app="$1"
+    local mp
+    if ! mp="$(get_mountpoint "." 2>/dev/null)"; then
+        if [ "$force" = false ]; then
+            echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
+        fi
+        return 1
+    fi
+
+    local dir
+    dir="$(trash_dir_for_mountpoint "$mp")"
+    if [ ! -d "$dir" ]; then
+        return 0
+    fi
+
+    local matches_file
+    if ! matches_file="$(mktemp)"; then
+        if [ "$force" = false ]; then
+            echo "rm: cannot clean trash entries for app '$app': failed to create temp file" >&2
+        fi
+        return 1
+    fi
+
+    find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | awk -v app="$app" '
+        BEGIN { RS = "\0"; ORS = "" }
+        {
+            base = $0
+            sub(/^.*\//, "", base)
+            if (substr(base, 1, length(app) + 2) == "(" app ")") {
+                printf "%s%c", $0, 0
+            }
+        }
+    ' > "$matches_file" 2>/dev/null || true
+
+    # shellcheck disable=SC2016 # $0 belongs to awk, not the shell.
+    find "$dir" -mindepth 1 -maxdepth 1 -type d -exec sh -c '
+        for run_dir do
+            base="${run_dir##*/}"
+            case "$base" in
+                "($1)"*) continue ;;
+            esac
+            metadata="$run_dir/metadata.json"
+            if [ -f "$metadata" ]; then
+                printf "%s\0" "$metadata"
+            fi
+        done
+    ' sh "$app" {} + 2>/dev/null | xargs -0 -r awk -v app="$app" '
+        /^[[:space:]]*"invoked_by"[[:space:]]*:/ {
+            line = $0
+            sub(/^[^:]*:[[:space:]]*"/, "", line)
+            sub(/"[[:space:]]*,?[[:space:]]*$/, "", line)
+            count = split(line, chain, /[[:space:]]*<-[[:space:]]*/)
+            for (i = 1; i <= count; i++) {
+                if (chain[i] == app) {
+                    sub(/\/metadata\.json$/, "", FILENAME)
+                    printf "%s%c", FILENAME, 0
+                    nextfile
+                }
+            }
+        }
+    ' >> "$matches_file" 2>/dev/null || true
+
+    local match_count
+    match_count="$(tr -cd '\0' < "$matches_file" | wc -c)"
+
+    if [ "$match_count" -eq 0 ]; then
+        /bin/rm -f -- "$matches_file"
+        return 0
+    fi
+
+    if [ "$force" = false ] && [ -t 0 ] && [ -t 1 ]; then
+        echo "WARNING: This will permanently delete $match_count trash run(s) from '$dir' whose execution chain includes app '$app'." >&2
+        echo -n "To confirm, please type the app name '$app': " >&2
+        local response
+        if ! read -r response; then
+            echo -e "\nError: Failed to read confirmation. Aborting." >&2
+            /bin/rm -f -- "$matches_file"
+            return 1
+        fi
+        if [ "$response" != "$app" ]; then
+            echo "Confirmation failed (input did not match '$app'). Aborting." >&2
+            /bin/rm -f -- "$matches_file"
+            return 1
+        fi
+    fi
+
+    if ! xargs -0 -r /bin/rm -rf -- < "$matches_file"; then
+        /bin/rm -f -- "$matches_file"
+        if [ "$force" = false ]; then
+            echo "rm: cannot clean trash entries for app '$app': deletion failed" >&2
+        fi
+        return 1
+    fi
+
+    /bin/rm -f -- "$matches_file"
     return 0
 }
 
@@ -380,6 +653,13 @@ trash_one() {
 
 if [ "$clean_current_mountpoint" = true ]; then
     if clean_current_trash; then
+        exit 0
+    fi
+    exit 1
+fi
+
+if [ -n "$clean_app" ]; then
+    if clean_trash_by_app "$clean_app"; then
         exit 0
     fi
     exit 1
